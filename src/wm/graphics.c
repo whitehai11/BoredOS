@@ -98,7 +98,8 @@ void graphics_update_resolution(int width, int height, int bpp, void* fb_addr, i
 void graphics_set_font(const char *path) {
     ttf_font_t *new_font = font_manager_load(path, 15.0f);
     if (new_font) {
-        // TODO: free old font data if needed
+        // No need to free: fonts are owned by font_manager's cache (loaded_fonts[]),
+        // g_current_ttf is just a pointer into that cache.
         g_current_ttf = new_font;
         serial_write("[FONT] Switched to: ");
         serial_write(path);
