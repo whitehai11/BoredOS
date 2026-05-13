@@ -1826,9 +1826,14 @@ void explorer_import_file(Window *win, const char *source_path) {
 Window* explorer_create_window(const char *path) {
     if (explorer_win_count >= 10) return NULL;
     
-    Window *win = (Window*)kmalloc(sizeof(Window));
-    ExplorerState *state = (ExplorerState*)kmalloc(sizeof(ExplorerState));
-    if (!state || !win) return NULL;
+    Window *win = kmalloc(sizeof(Window));
+    if (!win) return NULL;
+
+    ExplorerState *state = kmalloc(sizeof(ExplorerState));
+    if (!state) {
+        kfree(win);
+        return NULL;
+    }
     mem_memset(state, 0, sizeof(ExplorerState));
     
     win->title = "Files";
