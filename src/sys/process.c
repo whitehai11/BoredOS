@@ -354,7 +354,8 @@ process_t* process_create_elf(const char* filepath, const char* args_str, bool t
     // Increase to 256KB to prevent stack smashing on heavy networking
     size_t user_stack_size = 262144;
     void* stack = kmalloc_aligned(user_stack_size, 4096);
-    void* kernel_stack = kmalloc_aligned(65536, 65536); 
+    // 128KB kernel stack - mbedTLS handshake needs ~50-80KB in the worst case
+    void* kernel_stack = kmalloc_aligned(131072, 65536);
     
     // Map User stack to 0x800000
     for (uint64_t i = 0; i < (user_stack_size / 4096); i++) {
@@ -433,7 +434,7 @@ process_t* process_create_elf(const char* filepath, const char* args_str, bool t
     current_user_sp &= ~15ULL;
 
     // 4. Build Stack Frame for context switch via IRETQ
-    uint64_t* stack_ptr = (uint64_t*)((uint64_t)kernel_stack + 65536);
+    uint64_t* stack_ptr = (uint64_t*)((uint64_t)kernel_stack + 131072);
     *(--stack_ptr) = 0x1B;            // SS (User Mode Data)
     *(--stack_ptr) = current_user_sp; // RSP (Updated user stack pointer)
     *(--stack_ptr) = 0x202;           // RFLAGS (Interrupts Enabled)
@@ -464,11 +465,11 @@ process_t* process_create_elf(const char* filepath, const char* args_str, bool t
     asm volatile("fninit");
     asm volatile("fxsave %0" : "=m"(*stack_ptr));
 
-    new_proc->kernel_stack = (uint64_t)kernel_stack + 65536;
+    new_proc->kernel_stack = (uint64_t)kernel_stack + 131072;
     new_proc->kernel_stack_alloc = kernel_stack;
     new_proc->user_stack_alloc = stack;
     new_proc->rsp = (uint64_t)stack_ptr;
-    new_proc->used_memory = elf_load_size + user_stack_size + 65536;
+    new_proc->used_memory = elf_load_size + user_stack_size + 131072;
 
     // Initialize FPU state for new process
     asm volatile("fninit");
@@ -1062,7 +1063,7 @@ int process_exec_replace_current(registers_t *regs, const char* filepath, const 
 
     proc->pml4_phys = new_pml4;
     proc->user_stack_alloc = stack;
-    proc->used_memory = elf_load_size + user_stack_size + 65536;
+    proc->used_memory = elf_load_size + user_stack_size + 131072;
     proc->heap_start = 0x20000000;
     proc->heap_end = 0x20000000;
     proc->sleep_until = 0;

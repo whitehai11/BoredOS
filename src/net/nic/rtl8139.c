@@ -30,7 +30,7 @@
 #define RTL8139_CR_RST        (1 << 4) // Reset
 
 static int rtl8139_initialized = 0;
-static uint64_t mmio_base_addr = 0;
+static uint16_t io_base = 0;
 static uint8_t mac_addr[6];
 
 // Receive buffer must be 8K + 16 bytes + 1.5K
@@ -42,13 +42,13 @@ static uint16_t rx_ptr = 0; // Current read position
 static uint8_t tx_buffers[4][4096] __attribute__((aligned(4096)));
 static uint8_t tx_curr = 0;
 
-static inline uint8_t rtl8139_inb(uint16_t offset) { return *(volatile uint8_t*)(uintptr_t)(mmio_base_addr + offset); }
-static inline uint16_t rtl8139_inw(uint16_t offset) { return *(volatile uint16_t*)(uintptr_t)(mmio_base_addr + offset); }
-static inline uint32_t rtl8139_inl(uint16_t offset) { return *(volatile uint32_t*)(uintptr_t)(mmio_base_addr + offset); }
+static inline uint8_t  rtl8139_inb(uint16_t offset)  { return inb(io_base + offset); }
+static inline uint16_t rtl8139_inw(uint16_t offset)  { return inw(io_base + offset); }
+static inline uint32_t rtl8139_inl(uint16_t offset)  { return inl(io_base + offset); }
 
-static inline void rtl8139_outb(uint16_t offset, uint8_t value) { *(volatile uint8_t*)(uintptr_t)(mmio_base_addr + offset) = value; }
-static inline void rtl8139_outw(uint16_t offset, uint16_t value) { *(volatile uint16_t*)(uintptr_t)(mmio_base_addr + offset) = value; }
-static inline void rtl8139_outl(uint16_t offset, uint32_t value) { *(volatile uint32_t*)(uintptr_t)(mmio_base_addr + offset) = value; }
+static inline void rtl8139_outb(uint16_t offset, uint8_t  val) { outb(io_base + offset, val); }
+static inline void rtl8139_outw(uint16_t offset, uint16_t val) { outw(io_base + offset, val); }
+static inline void rtl8139_outl(uint16_t offset, uint32_t val) { outl(io_base + offset, val); }
 
 int rtl8139_init(pci_device_t* pci_dev) {
     if (rtl8139_initialized) return 0;
@@ -57,15 +57,16 @@ int rtl8139_init(pci_device_t* pci_dev) {
     uint32_t command = pci_read_config(pci_dev->bus, pci_dev->device, pci_dev->function, 0x04);
     pci_write_config(pci_dev->bus, pci_dev->device, pci_dev->function, 0x04, command | (1 << 2) | (1 << 1));
 
-    uint32_t bar1 = pci_read_config(pci_dev->bus, pci_dev->device, pci_dev->function, 0x14); // BAR1: MMIO
-    if (bar1 == 0 || bar1 == 0xFFFFFFFF) return -1;
-    if (bar1 & 1) return -1; // Should not be I/O space
+    // BAR0 is I/O space on QEMU's RTL8139
+    uint32_t bar0 = pci_read_config(pci_dev->bus, pci_dev->device, pci_dev->function, 0x10);
+    if (bar0 == 0 || bar0 == 0xFFFFFFFF) return -1;
+    if (!(bar0 & 1)) return -1; // must be I/O space
 
-    mmio_base_addr = p2v(bar1 & ~0xF);
+    io_base = (uint16_t)(bar0 & ~0x3);
 
     extern void serial_write(const char *str);
-    serial_write("[RTL8139] MMIO Base: 0x");
-    char hex_buf[32]; itoa_hex(mmio_base_addr, hex_buf); serial_write(hex_buf); serial_write("\n");
+    serial_write("[RTL8139] I/O Base: 0x");
+    char hex_buf[32]; itoa_hex(io_base, hex_buf); serial_write(hex_buf); serial_write("\n");
 
     // Power on (CONFIG1)
     rtl8139_outb(RTL8139_CONFIG_1, 0x00);

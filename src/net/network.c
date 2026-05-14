@@ -4,6 +4,7 @@
 #include "lwip/init.h"
 #include "lwip/altcp.h"
 #include "lwip/altcp_tls.h"
+#include "lwip/priv/altcp_priv.h"
 #include "mbedtls/ssl.h"
 #include "lwip/timeouts.h"
 #include "lwip/etharp.h"
@@ -463,7 +464,12 @@ int network_tls_connect(const ipv4_address_t *ip, uint16_t port, const char *hos
     uint64_t flags = spinlock_acquire_irqsave(&network_lock);
 
     /* tear down any previous TLS session */
-    if (current_tls_pcb) { altcp_abort(current_tls_pcb); current_tls_pcb = NULL; }
+    if (current_tls_pcb) {
+        struct altcp_pcb *old = current_tls_pcb;
+        current_tls_pcb = NULL;
+        altcp_abort(old);
+        altcp_free(old); // deallocs mbedTLS state + returns PCB to pool
+    }
     if (current_tls_config) { altcp_tls_free_config(current_tls_config); current_tls_config = NULL; }
     if (tls_recv_queue) { pbuf_free(tls_recv_queue); tls_recv_queue = NULL; }
 
@@ -576,7 +582,12 @@ int network_tls_recv_nb(void *buf, size_t max_len) {
 int network_tls_close(void) {
     uint64_t flags = spinlock_acquire_irqsave(&network_lock);
     if (tls_recv_queue) { pbuf_free(tls_recv_queue); tls_recv_queue = NULL; }
-    if (current_tls_pcb) { altcp_abort(current_tls_pcb); current_tls_pcb = NULL; }
+    if (current_tls_pcb) {
+        struct altcp_pcb *old = current_tls_pcb;
+        current_tls_pcb = NULL;
+        altcp_abort(old);
+        altcp_free(old);
+    }
     if (current_tls_config) { altcp_tls_free_config(current_tls_config); current_tls_config = NULL; }
     tls_closed = tls_connect_done = tls_connect_error = 0;
     spinlock_release_irqrestore(&network_lock, flags);

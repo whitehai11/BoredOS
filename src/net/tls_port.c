@@ -14,7 +14,7 @@
 
 uint32_t wm_get_ticks(void);
 
-#define TLS_HEAP_SIZE (256 * 1024)
+#define TLS_HEAP_SIZE (512 * 1024)
 static unsigned char g_tls_heap[TLS_HEAP_SIZE];
 
 // returns 1 if RDRAND worked

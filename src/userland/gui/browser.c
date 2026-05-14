@@ -4,6 +4,7 @@
 // BOREDOS_APP_ICONS: /Library/images/icons/colloid/web-browser.png
 #include "libc/syscall.h"
 #include "libc/libui.h"
+#include "libc/stdio.h"
 #include "stb_image.h"
 #include <stdbool.h>
 #include <stddef.h>
@@ -97,11 +98,27 @@ typedef struct {
 static RenderElement elements[MAX_ELEMENTS];
 static int element_count = 0;
 
-static char url_input_buffer[512] = "http://find.boreddev.nl";
-static int url_cursor = 22;
-static char current_host[256] = "find.boreddev.nl";
+static char url_input_buffer[512] = "about:home";
+static int url_cursor = 10;
+static char current_host[256] = "";
 static int current_port = 80;
 static int next_form_id = 1;
+static bool current_is_https = false;
+static uint32_t page_bg_color = 0; // 0 = use COLOR_BG
+
+#define MAX_CSS_RULES 128
+typedef struct {
+    char sel[64];
+    uint32_t color;    // 0 = not set
+    uint32_t bg_color;
+    float font_size;   // 0 = not set
+    int bold;          // -1=unset, 0=normal, 1=bold
+    int italic;        // -1=unset
+    int display_none;
+    int text_align;    // 0=unset, 1=left, 2=center, 3=right
+} CSSRule;
+static CSSRule css_rules[MAX_CSS_RULES];
+static int css_rule_count = 0;
 
 static ui_window_t win_browser;
 static int scroll_y = 0;
@@ -230,14 +247,34 @@ static char dns_cache_host[256] = "";
 static net_ipv4_address_t dns_cache_ip;
 
 static int fetch_content(const char *url, char *dest_buf, int max_len, bool progressive) {
+    // local file read
+    if (str_istarts_with(url, "file://")) {
+        const char *path = url + 7;
+        FILE *f = fopen(path, "rb");
+        if (!f) return 0;
+        const char *hdrs = "HTTP/1.0 200 OK\r\nContent-Type: application/octet-stream\r\n\r\n";
+        int hl = 0; while (hdrs[hl]) hl++;
+        for (int k = 0; k < hl; k++) dest_buf[k] = hdrs[k];
+        int total = hl;
+        while (total < max_len - 1) {
+            int n = (int)fread(dest_buf + total, 1, max_len - 1 - total, f);
+            if (n <= 0) break;
+            total += n;
+        }
+        fclose(f);
+        dest_buf[total] = 0;
+        return total;
+    }
+
     const char* host_start = url;
+    int is_https = 0;
+    int port = 80;
     if (url[0] == 'h' && url[1] == 't' && url[2] == 't' && url[3] == 'p') {
-        if (url[4] == 's' && url[5] == ':') host_start = url + 8;
-        else if (url[4] == ':') host_start = url + 7;
+        if (url[4] == 's' && url[5] == ':') { is_https = 1; port = 443; host_start = url + 8; }
+        else if (url[4] == ':') { host_start = url + 7; }
     }
 
     char hostname[256];
-    int port = 80;
     int i = 0;
     while (host_start[i] && host_start[i] != '/' && host_start[i] != ':' && i < 255) {
         hostname[i] = host_start[i];
@@ -272,7 +309,9 @@ static int fetch_content(const char *url, char *dest_buf, int max_len, bool prog
         }
     }
     
-    if (sys_tcp_connect(&ip, port) != 0) return 0;
+    int conn_ok = is_https ? sys_tls_connect(&ip, (uint16_t)port, hostname)
+                           : sys_tcp_connect(&ip, port);
+    if (conn_ok != 0) return 0;
     
     const char* path = host_start + i;
     if (*path == 0) path = "/";
@@ -284,14 +323,16 @@ static int fetch_content(const char *url, char *dest_buf, int max_len, bool prog
     s = path; while(*s) *r++ = *s++;
     s = " HTTP/1.1\r\nHost: "; while(*s) *r++ = *s++;
     s = hostname; while(*s) *r++ = *s++;
-    if (current_port != 80) {
+    int default_port = is_https ? 443 : 80;
+    if (current_port != default_port) {
         *r++ = ':';
         char pbuf[10]; itoa(current_port, pbuf);
         s = pbuf; while(*s) *r++ = *s++;
     }
     s = "\r\nUser-Agent: BoredOS/BoredBrowserium\r\nAccept: */*\r\nConnection: close\r\n\r\n"; while(*s) *r++ = *s++;
-    
-    sys_tcp_send(request, r - request);
+
+    if (is_https) sys_tls_send(request, r - request);
+    else sys_tcp_send(request, r - request);
     
     int total = 0;
     int last_render = 0;
@@ -299,7 +340,8 @@ static int fetch_content(const char *url, char *dest_buf, int max_len, bool prog
     long long last_data_tick = sys_system(SYSTEM_CMD_GET_TICKS, 0, 0, 0, 0);
 
     while (1) {
-        int len = sys_tcp_recv_nb(dest_buf + total, max_len - 1 - total);
+        int len = is_https ? sys_tls_recv_nb(dest_buf + total, max_len - 1 - total)
+                           : sys_tcp_recv_nb(dest_buf + total, max_len - 1 - total);
         if (len < 0 && len != -2) break;
         if (len == -2) break;
         
@@ -413,7 +455,8 @@ static int fetch_content(const char *url, char *dest_buf, int max_len, bool prog
         }
     }
     dest_buf[total] = 0;
-    sys_tcp_close();
+    if (is_https) sys_tls_close();
+    else sys_tcp_close();
     return total;
 }
 
@@ -535,13 +578,14 @@ static int decode_chunked_bin(char *body, int total_len) {
 
 static void load_image(RenderElement *el) {
     char url[512];
-    if (str_istarts_with(el->attr_value, "http")) {
+    if (str_istarts_with(el->attr_value, "http") || str_istarts_with(el->attr_value, "file://")) {
         int k=0; while(el->attr_value[k]) { url[k] = el->attr_value[k]; k++; } url[k] = 0;
     } else {
         char *u = url;
-        const char *s = "http://"; while(*s) *u++ = *s++;
+        const char *s = current_is_https ? "https://" : "http://"; while(*s) *u++ = *s++;
         s = current_host; while(*s) *u++ = *s++;
-        if (current_port != 80) {
+        int _dp = current_is_https ? 443 : 80;
+        if (current_port != _dp) {
             *u++ = ':';
             char pbuf[10]; itoa(current_port, pbuf);
             const char* ps = pbuf; while(*ps) *u++ = *ps++;
@@ -726,6 +770,270 @@ static void browser_reflow(void) {
     flush_line();
 }
 
+
+static void css_clear(void) {
+    css_rule_count = 0;
+    page_bg_color = 0;
+}
+
+static const char *css_skipws(const char *p) {
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+    return p;
+}
+
+// forward decl
+static uint32_t parse_html_color(const char *str);
+
+static uint32_t css_parse_color(const char *val) {
+    while (*val == ' ') val++;
+    if (*val == '#') {
+        char *end;
+        uint32_t v = (uint32_t)strtol(val + 1, &end, 16);
+        int len = (int)(end - (val + 1));
+        if (len == 3) {
+            // expand #abc → #aabbcc
+            uint32_t r = (v >> 8) & 0xF, g = (v >> 4) & 0xF, b = v & 0xF;
+            v = (r << 20)|(r << 16)|(g << 12)|(g << 8)|(b << 4)|b;
+        }
+        return 0xFF000000 | v;
+    }
+    if (str_istarts_with(val, "rgb(")) {
+        val += 4;
+        int r = atoi(val); while (*val && *val != ',') val++; if (*val) val++;
+        int g = atoi(val); while (*val && *val != ',') val++; if (*val) val++;
+        int b = atoi(val);
+        if (r < 0) r = 0; if (r > 255) r = 255;
+        if (g < 0) g = 0; if (g > 255) g = 255;
+        if (b < 0) b = 0; if (b > 255) b = 255;
+        return 0xFF000000 | ((uint32_t)r << 16) | ((uint32_t)g << 8) | (uint32_t)b;
+    }
+    if (str_istarts_with(val, "transparent")) return 0;
+    return parse_html_color(val);
+}
+
+static void css_apply_decl(CSSRule *r, const char *prop, const char *val) {
+    while (*prop == ' ' || *prop == '\t') prop++;
+    while (*val == ' ' || *val == '\t') val++;
+    if (!*prop || !*val) return;
+
+    if (str_iequals(prop, "color")) {
+        uint32_t c = css_parse_color(val);
+        if (c) r->color = c;
+    } else if (str_iequals(prop, "background-color") || str_iequals(prop, "background")) {
+        if (!str_istarts_with(val, "none") && !str_istarts_with(val, "url(") &&
+            !str_istarts_with(val, "linear-gradient") && !str_istarts_with(val, "radial-gradient")) {
+            uint32_t c = css_parse_color(val);
+            if (c) r->bg_color = c;
+        }
+    } else if (str_iequals(prop, "font-weight")) {
+        r->bold = str_istarts_with(val, "bold") ? 1 : 0;
+    } else if (str_iequals(prop, "font-style")) {
+        r->italic = str_istarts_with(val, "italic") ? 1 : 0;
+    } else if (str_iequals(prop, "font-size")) {
+        char *end; float sz = (float)strtol(val, &end, 10);
+        if (sz > 0) {
+            if (str_istarts_with(end, "px")) r->font_size = sz;
+            else if (str_istarts_with(end, "em")) r->font_size = sz * 15.0f;
+            else if (str_istarts_with(end, "pt")) r->font_size = sz * 1.33f;
+            else if (str_istarts_with(end, "%")) r->font_size = sz * 0.15f;
+            else r->font_size = sz;
+            if (r->font_size < 8.0f) r->font_size = 8.0f;
+            if (r->font_size > 72.0f) r->font_size = 72.0f;
+        }
+    } else if (str_iequals(prop, "text-align")) {
+        if (str_istarts_with(val, "center")) r->text_align = 2;
+        else if (str_istarts_with(val, "right")) r->text_align = 3;
+        else r->text_align = 1;
+    } else if (str_iequals(prop, "display")) {
+        if (str_istarts_with(val, "none")) r->display_none = 1;
+    }
+}
+
+static void css_parse_decls(CSSRule *r, const char *block, int blen) {
+    char buf[1024]; int l = blen < 1023 ? blen : 1023;
+    for (int k = 0; k < l; k++) buf[k] = block[k];
+    buf[l] = 0;
+    char *p = buf;
+    while (*p) {
+        char *semi = p; while (*semi && *semi != ';') semi++;
+        char saved = *semi; *semi = 0;
+        char *colon = p; while (*colon && *colon != ':') colon++;
+        if (*colon == ':') {
+            *colon = 0;
+            css_apply_decl(r, p, colon + 1);
+        }
+        *semi = saved;
+        p = *semi ? semi + 1 : semi;
+    }
+}
+
+static void css_parse_sheet(const char *css) {
+    const char *p = css;
+    while (*p) {
+        p = css_skipws(p);
+        if (!*p) break;
+        if (p[0] == '/' && p[1] == '*') {
+            p += 2;
+            while (*p && !(p[0] == '*' && p[1] == '/')) p++;
+            if (*p) p += 2;
+            continue;
+        }
+        if (*p == '@') {
+            while (*p && *p != '{' && *p != ';') p++;
+            if (*p == ';') { p++; continue; }
+            if (*p == '{') {
+                int depth = 1; p++;
+                while (*p && depth > 0) {
+                    if (*p == '{') depth++;
+                    else if (*p == '}') depth--;
+                    p++;
+                }
+            }
+            continue;
+        }
+        // read selector(s)
+        char sel_buf[128]; int si = 0;
+        while (*p && *p != '{' && si < 127) sel_buf[si++] = *p++;
+        sel_buf[si] = 0;
+        if (*p != '{') break;
+        p++;
+        const char *block_start = p;
+        while (*p && *p != '}') p++;
+        int block_len = (int)(p - block_start);
+        if (*p) p++;
+
+        // handle comma-separated selectors
+        char *sp = sel_buf;
+        while (sp) {
+            char *comma = strchr(sp, ',');
+            if (comma) *comma = 0;
+            // trim
+            while (*sp == ' ' || *sp == '\t' || *sp == '\r' || *sp == '\n') sp++;
+            int slen = (int)strlen(sp);
+            while (slen > 0 && (sp[slen-1]==' '||sp[slen-1]=='\t'||sp[slen-1]=='\r'||sp[slen-1]=='\n')) { sp[slen-1]=0; slen--; }
+            if (*sp && css_rule_count < MAX_CSS_RULES) {
+                CSSRule *r = &css_rules[css_rule_count];
+                for (int k = 0; k < (int)sizeof(CSSRule); k++) ((char*)r)[k] = 0;
+                r->bold = -1; r->italic = -1;
+                int k = 0; while (sp[k] && k < 63) { r->sel[k] = sp[k]; k++; } r->sel[k] = 0;
+                css_parse_decls(r, block_start, block_len);
+                css_rule_count++;
+            }
+            sp = comma ? comma + 1 : NULL;
+        }
+    }
+}
+
+// pre-pass: find <style> blocks and parse them
+static void css_extract_and_parse(const char *html) {
+    static char css_buf[16384];
+    const char *p = html;
+    while ((p = str_istrstr(p, "<style")) != NULL) {
+        while (*p && *p != '>') p++;
+        if (*p) p++;
+        const char *end = str_istrstr(p, "</style");
+        if (!end) break;
+        int len = (int)(end - p);
+        if (len > (int)sizeof(css_buf) - 1) len = sizeof(css_buf) - 1;
+        for (int k = 0; k < len; k++) css_buf[k] = p[k];
+        css_buf[len] = 0;
+        css_parse_sheet(css_buf);
+        p = end;
+    }
+}
+
+// apply matching CSS rules to current parse state
+// sel_prefix: "." for class, "#" for id, "" for tag
+static void css_apply_rules(const char *name, const char *prefix,
+                             uint32_t *color, uint32_t *bg_color, float *scale,
+                             bool *bold, bool *italic, int *text_align) {
+    char full[68];
+    int l = 0;
+    while (prefix[l]) { full[l] = prefix[l]; l++; }
+    int ni = 0; while (name[ni] && l < 67) { full[l++] = name[ni++]; } full[l] = 0;
+
+    for (int i = 0; i < css_rule_count; i++) {
+        CSSRule *r = &css_rules[i];
+        if (!str_iequals(r->sel, full)) continue;
+        if (r->color && color) *color = r->color;
+        if (r->bg_color && bg_color) *bg_color = r->bg_color;
+        if (r->font_size > 0 && scale) *scale = r->font_size;
+        if (r->bold == 1 && bold) *bold = true;
+        if (r->bold == 0 && bold) *bold = false;
+        if (r->italic == 1 && italic) *italic = true;
+        if (r->italic == 0 && italic) *italic = false;
+        if (r->text_align && text_align) *text_align = r->text_align;
+    }
+}
+
+// parse "class='foo bar'" and apply each class rule
+static void css_apply_classes(const char *attr_buf,
+                               uint32_t *color, uint32_t *bg_color, float *scale,
+                               bool *bold, bool *italic, int *text_align) {
+    const char *cls = str_istrstr(attr_buf, "class=\"");
+    if (!cls) cls = str_istrstr(attr_buf, "class='");
+    if (!cls) return;
+    cls += 7;
+    char id_str = str_istrstr(attr_buf, "class='") ? '\'' : '"';
+    // parse space-separated class names
+    while (*cls && *cls != '"' && *cls != '\'') {
+        while (*cls == ' ') cls++;
+        if (!*cls || *cls == '"' || *cls == '\'') break;
+        char cname[64]; int ci = 0;
+        while (*cls && *cls != ' ' && *cls != '"' && *cls != '\'' && ci < 63)
+            cname[ci++] = *cls++;
+        cname[ci] = 0;
+        if (ci > 0) css_apply_rules(cname, ".", color, bg_color, scale, bold, italic, text_align);
+    }
+    (void)id_str;
+}
+
+// parse id="foo" and apply #foo rule
+static void css_apply_id(const char *attr_buf,
+                          uint32_t *color, uint32_t *bg_color, float *scale,
+                          bool *bold, bool *italic, int *text_align) {
+    const char *id = str_istrstr(attr_buf, "id=\"");
+    if (!id) id = str_istrstr(attr_buf, "id='");
+    if (!id) return;
+    id += 4;
+    char iname[64]; int ii = 0;
+    while (*id && *id != '"' && *id != '\'' && ii < 63) iname[ii++] = *id++;
+    iname[ii] = 0;
+    if (ii > 0) css_apply_rules(iname, "#", color, bg_color, scale, bold, italic, text_align);
+}
+
+// parse inline style="..." attribute
+static void css_apply_inline(const char *attr_buf,
+                              uint32_t *color, uint32_t *bg_color, float *scale,
+                              bool *bold, bool *italic, int *text_align) {
+    const char *st = str_istrstr(attr_buf, "style=\"");
+    if (!st) st = str_istrstr(attr_buf, "style='");
+    if (!st) return;
+    st += 7;
+    CSSRule tmp; for (int k = 0; k < (int)sizeof(CSSRule); k++) ((char*)&tmp)[k] = 0;
+    tmp.bold = -1; tmp.italic = -1;
+    char buf[512]; int l = 0;
+    while (*st && *st != '"' && *st != '\'' && l < 511) buf[l++] = *st++;
+    buf[l] = 0;
+    css_parse_decls(&tmp, buf, l);
+    if (tmp.color && color) *color = tmp.color;
+    if (tmp.bg_color && bg_color) *bg_color = tmp.bg_color;
+    if (tmp.font_size > 0 && scale) *scale = tmp.font_size;
+    if (tmp.bold == 1 && bold) *bold = true;
+    if (tmp.bold == 0 && bold) *bold = false;
+    if (tmp.italic == 1 && italic) *italic = true;
+    if (tmp.italic == 0 && italic) *italic = false;
+    if (tmp.text_align && text_align) *text_align = tmp.text_align;
+}
+
+// combined: apply class, id, and inline style
+static void css_apply_all(const char *attr_buf,
+                           uint32_t *color, uint32_t *bg_color, float *scale,
+                           bool *bold, bool *italic, int *text_align) {
+    css_apply_classes(attr_buf, color, bg_color, scale, bold, italic, text_align);
+    css_apply_id(attr_buf, color, bg_color, scale, bold, italic, text_align);
+    css_apply_inline(attr_buf, color, bg_color, scale, bold, italic, text_align);
+}
 
 static uint32_t parse_html_color(const char *str) {
     if (!str) return COLOR_TEXT;
@@ -934,7 +1242,11 @@ static void parse_html(const char *html) {
                     current_form_id = 0; current_form_action[0] = 0;
                 }
                 else if (str_iequals(tag_name+1, "a")) current_link[0] = 0;
-                else if (str_iequals(tag_name+1, "p") || str_iequals(tag_name+1, "li") || str_iequals(tag_name+1, "div") || str_iequals(tag_name+1, "address")) { emit_br(); }
+                else if (str_iequals(tag_name+1, "span")) {
+                    if (font_ptr > 0) { font_ptr--; current_color = font_stack[font_ptr].color; current_scale = font_stack[font_ptr].scale; }
+                    else { current_color = COLOR_TEXT; current_scale = base_scale; }
+                }
+                else if (str_iequals(tag_name+1, "p") || str_iequals(tag_name+1, "li") || str_iequals(tag_name+1, "div") || str_iequals(tag_name+1, "address") || str_iequals(tag_name+1, "section") || str_iequals(tag_name+1, "article") || str_iequals(tag_name+1, "header") || str_iequals(tag_name+1, "footer") || str_iequals(tag_name+1, "main") || str_iequals(tag_name+1, "nav")) { emit_br(); }
                 else if (str_iequals(tag_name+1, "pre") || str_iequals(tag_name+1, "xmp") || str_iequals(tag_name+1, "listing")) { emit_br(); is_pre = false; }
                 else if (str_iequals(tag_name+1, "font") || str_iequals(tag_name+1, "tt") || str_iequals(tag_name+1, "code") || str_iequals(tag_name+1, "samp") || str_iequals(tag_name+1, "kbd")) {
                     if (font_ptr > 0) {
@@ -1009,7 +1321,32 @@ static void parse_html(const char *html) {
                 }
                 else if (str_iequals(tag_name, "plaintext")) { emit_br(); is_plaintext = true; is_pre = true; current_scale = 14.0f; }
                 else if (str_iequals(tag_name, "address")) { emit_br(); }
-                else if (str_iequals(tag_name, "html") || str_iequals(tag_name, "body")) skip_content = false;
+                else if (str_iequals(tag_name, "html")) skip_content = false;
+                else if (str_iequals(tag_name, "body")) {
+                    skip_content = false;
+                    char *bg = str_istrstr(attr_buf, "bgcolor=\"");
+                    if (bg) page_bg_color = parse_html_color(bg + 9);
+                    uint32_t bg2 = 0;
+                    css_apply_inline(attr_buf, &current_color, &bg2, NULL, NULL, NULL, NULL);
+                    if (bg2) page_bg_color = bg2;
+                    // apply body CSS rule (color + background)
+                    css_apply_rules("body", "", &current_color, &page_bg_color, NULL, NULL, NULL, NULL);
+                }
+                else if (str_iequals(tag_name, "span")) {
+                    if (font_ptr < MAX_FONT_STACK) {
+                        font_stack[font_ptr].color = current_color;
+                        font_stack[font_ptr].scale = current_scale;
+                        font_ptr++;
+                    }
+                    css_apply_all(attr_buf, &current_color, NULL, &current_scale, &is_bold, &is_italic, NULL);
+                }
+                else if (str_iequals(tag_name, "section") || str_iequals(tag_name, "article") ||
+                         str_iequals(tag_name, "header") || str_iequals(tag_name, "footer") ||
+                         str_iequals(tag_name, "main") || str_iequals(tag_name, "nav") ||
+                         str_iequals(tag_name, "aside")) {
+                    emit_br();
+                    css_apply_all(attr_buf, &current_color, NULL, &current_scale, &is_bold, &is_italic, NULL);
+                }
                 else if (str_iequals(tag_name, "head")) skip_content = true;
                 else if (str_iequals(tag_name, "title")) { skip_content = false; inside_title = true; page_title[0] = 0; }
 
@@ -1070,6 +1407,7 @@ static void parse_html(const char *html) {
                 else if (str_iequals(tag_name, "br")) emit_br();
                 else if (str_iequals(tag_name, "p") || str_iequals(tag_name, "div")) {
                     emit_br();
+                    css_apply_all(attr_buf, &current_color, NULL, &current_scale, &is_bold, &is_italic, NULL);
                 }
                 else if (str_iequals(tag_name, "pre")) { emit_br(); is_pre = true; current_scale = 14.0f; }
                 else if (str_iequals(tag_name, "li")) {
@@ -1397,7 +1735,11 @@ static void parse_html_incremental(const char *html, int safe_len) {
                 else if (tag_name[1] == 'h' && tag_name[2] >= '1' && tag_name[2] <= '6') { emit_br(); emit_br(); is_bold = false; is_italic = false; is_underline = false; base_scale = 15.0f; current_scale = 15.0f; }
                 else if (str_iequals(tag_name+1, "form")) { emit_br(); current_form_id = 0; current_form_action[0] = 0; }
                 else if (str_iequals(tag_name+1, "a")) current_link[0] = 0;
-                else if (str_iequals(tag_name+1, "p") || str_iequals(tag_name+1, "li") || str_iequals(tag_name+1, "div")) { emit_br(); }
+                else if (str_iequals(tag_name+1, "span")) {
+                    if (inc_font_ptr > 0) { inc_font_ptr--; current_color = inc_font_stack[inc_font_ptr].color; current_scale = inc_font_stack[inc_font_ptr].scale; }
+                    else { current_color = COLOR_TEXT; current_scale = base_scale; }
+                }
+                else if (str_iequals(tag_name+1, "p") || str_iequals(tag_name+1, "li") || str_iequals(tag_name+1, "div") || str_iequals(tag_name+1, "section") || str_iequals(tag_name+1, "article") || str_iequals(tag_name+1, "header") || str_iequals(tag_name+1, "footer") || str_iequals(tag_name+1, "main") || str_iequals(tag_name+1, "nav")) { emit_br(); }
                 else if (str_iequals(tag_name+1, "pre") || str_iequals(tag_name+1, "xmp") || str_iequals(tag_name+1, "listing")) { emit_br(); is_pre = false; }
                 else if (str_iequals(tag_name+1, "font") || str_iequals(tag_name+1, "tt") || str_iequals(tag_name+1, "code") || str_iequals(tag_name+1, "samp") || str_iequals(tag_name+1, "kbd")) {
                     if (inc_font_ptr > 0) {
@@ -1486,8 +1828,24 @@ static void parse_html_incremental(const char *html, int safe_len) {
                     }
                 }
                 else if (str_iequals(tag_name, "br")) emit_br();
-                else if (str_iequals(tag_name, "p") || str_iequals(tag_name, "div")) { 
+                else if (str_iequals(tag_name, "p") || str_iequals(tag_name, "div")) {
                     emit_br();
+                    css_apply_all(attr_buf, &current_color, NULL, &current_scale, &is_bold, &is_italic, NULL);
+                }
+                else if (str_iequals(tag_name, "span")) {
+                    if (inc_font_ptr < MAX_FONT_STACK) {
+                        inc_font_stack[inc_font_ptr].color = current_color;
+                        inc_font_stack[inc_font_ptr].scale = current_scale;
+                        inc_font_ptr++;
+                    }
+                    css_apply_all(attr_buf, &current_color, NULL, &current_scale, &is_bold, &is_italic, NULL);
+                }
+                else if (str_iequals(tag_name, "section") || str_iequals(tag_name, "article") ||
+                         str_iequals(tag_name, "header") || str_iequals(tag_name, "footer") ||
+                         str_iequals(tag_name, "main") || str_iequals(tag_name, "nav") ||
+                         str_iequals(tag_name, "aside")) {
+                    emit_br();
+                    css_apply_all(attr_buf, &current_color, NULL, &current_scale, &is_bold, &is_italic, NULL);
                 }
                 else if (str_iequals(tag_name, "pre")) { emit_br(); is_pre = true; current_scale = 14.0f; }
                 else if (str_iequals(tag_name, "li")) {
@@ -1500,7 +1858,15 @@ static void parse_html_incremental(const char *html, int safe_len) {
                 else if (str_iequals(tag_name, "form")) { emit_br(); current_form_id = next_form_id++; char *action = str_istrstr(attr_buf, "action=\""); if (action) { action += 8; int l = 0; while(action[l] && action[l] != '"' && l < 255) { current_form_action[l] = action[l]; l++; } current_form_action[l] = 0; } else current_form_action[0] = 0; }
                 else if (str_iequals(tag_name, "head") || str_iequals(tag_name, "script") || str_iequals(tag_name, "style") || str_iequals(tag_name, "noscript")) skip_content = true;
                 else if (str_iequals(tag_name, "title")) { skip_content = false; inside_title = true; page_title[0] = 0; }
-                else if (str_iequals(tag_name, "body")) skip_content = false;
+                else if (str_iequals(tag_name, "body")) {
+                    skip_content = false;
+                    char *bg = str_istrstr(attr_buf, "bgcolor=\"");
+                    if (bg) page_bg_color = parse_html_color(bg + 9);
+                    uint32_t bg2 = 0;
+                    css_apply_inline(attr_buf, &current_color, &bg2, NULL, NULL, NULL, NULL);
+                    if (bg2) page_bg_color = bg2;
+                    css_apply_rules("body", "", &current_color, &page_bg_color, NULL, NULL, NULL, NULL);
+                }
                 else if (str_iequals(tag_name, "a")) { char *href = str_istrstr(attr_buf, "href=\""); if (href) { href += 6; int l = 0; while(href[l] && href[l] != '"' && l < 255) { current_link[l] = href[l]; l++; } current_link[l] = 0; } }
                 else if (str_iequals(tag_name, "hr")) { emit_br(); RenderElement *el = &elements[element_count++]; for (int k=0; k<(int)sizeof(RenderElement); k++) ((char*)el)[k] = 0; el->tag = TAG_HR; el->list_depth = list_depth; el->blockquote_depth = blockquote_depth; el->h = 10; el->centered = true; emit_br(); }
                 else if (str_iequals(tag_name, "img")) {
@@ -1609,7 +1975,8 @@ static void parse_html_incremental(const char *html, int safe_len) {
 
 static void browser_paint(void) {
     browser_ctx.user_data = (void *)win_browser;
-    ui_draw_rect(win_browser, 0, 0, win_w, win_h, COLOR_BG);
+    uint32_t bg = page_bg_color ? page_bg_color : COLOR_BG;
+    ui_draw_rect(win_browser, 0, 0, win_w, win_h, bg);
     
     for (int i = 0; i < element_count; i++) {
         RenderElement *el = &elements[i];
@@ -1715,20 +2082,111 @@ static void browser_paint(void) {
     widget_scrollbar_draw(&browser_ctx, &browser_scrollbar);
 }
 
+static void navigate_internal(const char *url, int redirect_depth);
+
 static void navigate(const char *url) {
+    navigate_internal(url, 0);
+}
+
+static void navigate_internal(const char *url, int redirect_depth) {
+    if (redirect_depth > 5) return;
+
+    if (str_iequals(url, "about:home") || url[0] == 0) {
+        current_is_https = false;
+        current_host[0] = 0;
+        current_port = 80;
+        css_clear();
+        css_parse_sheet(
+            "body { background-color: #0d1117; color: #c9d1d9; }"
+            "h1 { color: #58a6ff; }"
+            "h2 { color: #58a6ff; }"
+            ".tagline { color: #8b949e; }"
+            "a { color: #58a6ff; }"
+            ".sep { color: #30363d; }"
+        );
+        page_bg_color = 0xFF0D1117;
+        parse_html(
+            "<html><body>"
+            "<br><br><br><br><br>"
+            "<center><img src=\"file:///Library/images/branding/bOS14.png\" width=\"220\"></center>"
+            "<br><br>"
+            "<center><h1>BoredOS</h1></center>"
+            "<center><p class=\"tagline\">BoredBrowser</p></center>"
+            "<br><br><br>"
+            "<center>"
+            "<form action=\"https://duckduckgo.com/\" method=\"get\">"
+            "<input name=\"q\" size=\"44\">"
+            "&nbsp;"
+            "<input type=\"submit\" value=\"Search\">"
+            "</form>"
+            "</center>"
+            "<br><br><br>"
+            "<center>"
+            "<a href=\"https://boredos.dev\">boredos.dev</a>"
+            "<span class=\"sep\">&nbsp;&nbsp;&bull;&nbsp;&nbsp;</span>"
+            "<a href=\"https://github.com/BoredDevNL/BoredOS\">GitHub</a>"
+            "<span class=\"sep\">&nbsp;&nbsp;&bull;&nbsp;&nbsp;</span>"
+            "<a href=\"https://boredos.dev/blog\">Blog</a>"
+            "</center>"
+            "</body></html>"
+        );
+        return;
+    }
+
+    current_is_https = (url[0]=='h' && url[1]=='t' && url[2]=='t' && url[3]=='p' &&
+                        url[4]=='s' && url[5]==':');
+
     static char main_resp[RESP_BUF_SIZE];
-    int resp_len = fetch_content(url, main_resp, sizeof(main_resp), true);
+    int resp_len = fetch_content(url, main_resp, sizeof(main_resp), redirect_depth == 0);
     if (resp_len <= 0) return;
+
+    // check for redirect
+    if (main_resp[0] == 'H' && main_resp[1] == 'T' && main_resp[2] == 'T' && main_resp[3] == 'P') {
+        const char *sp = main_resp + 9; // past "HTTP/1.x "
+        while (*sp == ' ') sp++;
+        int code = 0;
+        if (*sp >= '0' && *sp <= '9') code = (*sp - '0') * 100;
+        if (*(sp+1) >= '0' && *(sp+1) <= '9') code += (*(sp+1) - '0') * 10;
+        if (*(sp+2) >= '0' && *(sp+2) <= '9') code += *(sp+2) - '0';
+
+        if (code == 301 || code == 302 || code == 303 || code == 307 || code == 308) {
+            char *loc = str_istrstr(main_resp, "\nLocation:");
+            if (loc) {
+                loc += 10;
+                while (*loc == ' ') loc++;
+                char new_url[512]; int l = 0;
+                while (loc[l] && loc[l] != '\r' && loc[l] != '\n' && l < 511) {
+                    new_url[l] = loc[l]; l++;
+                }
+                new_url[l] = 0;
+                // update url bar
+                int k = 0; while (new_url[k]) { url_input_buffer[k] = new_url[k]; k++; } url_input_buffer[k] = 0; url_cursor = k;
+                navigate_internal(new_url, redirect_depth + 1);
+                return;
+            }
+        }
+    }
+
     char *body = strstr(main_resp, "\r\n\r\n");
     if (body) {
         body += 4;
         int hdr_len = body - main_resp;
         int body_len = resp_len - hdr_len;
+
+        css_clear();
+        css_extract_and_parse(body);
+
+        // apply body/html CSS rules to page background
+        for (int k = 0; k < css_rule_count; k++) {
+            if (str_iequals(css_rules[k].sel, "body") || str_iequals(css_rules[k].sel, "html")) {
+                if (css_rules[k].bg_color) page_bg_color = css_rules[k].bg_color;
+            }
+        }
+
         if (strstr(main_resp, "Transfer-Encoding: chunked")) {
             body_len = decode_chunked_bin(body, body_len);
             parse_html(body);
         } else {
-            // For non-chunked: finish incremental parse instead of re-parsing from scratch
             parse_html_incremental(body, body_len);
         }
     }
@@ -1796,7 +2254,7 @@ int main(int argc, char **argv) {
                     if (widget_button_handle_mouse(&btn_home, mx, my, is_down, is_click, NULL)) {
                         if (is_click) {
                             if (history_count < HISTORY_MAX) { int j=0; while(url_input_buffer[j]) { history_stack[history_count][j] = url_input_buffer[j]; j++; } history_stack[history_count][j] = 0; history_count++; }
-                            const char *home = "http://find.boreddev.nl";
+                            const char *home = "about:home";
                             int j=0; while(home[j]) { url_input_buffer[j] = home[j]; j++; } url_input_buffer[j] = 0; url_cursor = j;
                             navigate(url_input_buffer); scroll_y = 0; focused_element = -1;
                         }
@@ -1864,9 +2322,9 @@ int main(int argc, char **argv) {
                                 char *u = search_url;
                                 const char *s;
                                 if (el->form_action[0] == '/') {
-                                    s = "http://"; while(*s) *u++ = *s++;
+                                    s = current_is_https ? "https://" : "http://"; while(*s) *u++ = *s++;
                                     s = current_host; while(*s) *u++ = *s++;
-                                    if (current_port != 80) {
+                                    if (current_port != (current_is_https ? 443 : 80)) {
                                         *u++ = ':';
                                         char pbuf[10]; itoa(current_port, pbuf);
                                         const char* ps = pbuf; while(*ps) *u++ = *ps++;
@@ -1875,9 +2333,9 @@ int main(int argc, char **argv) {
                                 } else if (str_istarts_with(el->form_action, "http")) {
                                     s = el->form_action; while(*s) *u++ = *s++;
                                 } else {
-                                    s = "http://"; while(*s) *u++ = *s++;
+                                    s = current_is_https ? "https://" : "http://"; while(*s) *u++ = *s++;
                                     s = current_host; while(*s) *u++ = *s++;
-                                    if (current_port != 80) {
+                                    if (current_port != (current_is_https ? 443 : 80)) {
                                         *u++ = ':';
                                         char pbuf[10]; itoa(current_port, pbuf);
                                         const char* ps = pbuf; while(*ps) *u++ = *ps++;
@@ -1932,9 +2390,9 @@ int main(int argc, char **argv) {
                         if (el->link_url[0]) {
                             char new_url[512];
                             if (el->link_url[0] == '/') {
-                                char *u = new_url; const char *s = "http://"; while(*s) *u++ = *s++;
+                                char *u = new_url; const char *s = current_is_https ? "https://" : "http://"; while(*s) *u++ = *s++;
                                 s = current_host; while(*s) *u++ = *s++;
-                                if (current_port != 80) {
+                                if (current_port != (current_is_https ? 443 : 80)) {
                                     *u++ = ':';
                                     char pbuf[10]; itoa(current_port, pbuf);
                                     const char* ps = pbuf; while(*ps) *u++ = *ps++;
@@ -1943,9 +2401,9 @@ int main(int argc, char **argv) {
                             } else if (str_istarts_with(el->link_url, "http")) {
                                 int k=0; while(el->link_url[k]) { new_url[k] = el->link_url[k]; k++; } new_url[k] = 0;
                             } else {
-                                char *u = new_url; const char *s = "http://"; while(*s) *u++ = *s++;
-                                s = current_host; while(*s) *u++ = *s++; 
-                                if (current_port != 80) {
+                                char *u = new_url; const char *s = current_is_https ? "https://" : "http://"; while(*s) *u++ = *s++;
+                                s = current_host; while(*s) *u++ = *s++;
+                                if (current_port != (current_is_https ? 443 : 80)) {
                                     *u++ = ':';
                                     char pbuf[10]; itoa(current_port, pbuf);
                                     const char* ps = pbuf; while(*ps) *u++ = *ps++;
@@ -2013,9 +2471,9 @@ int main(int argc, char **argv) {
                         char *u = search_url;
                         const char *s;
                         if (el->form_action[0] == '/') {
-                            s = "http://"; while(*s) *u++ = *s++;
+                            s = current_is_https ? "https://" : "http://"; while(*s) *u++ = *s++;
                             s = current_host; while(*s) *u++ = *s++;
-                            if (current_port != 80) {
+                            if (current_port != (current_is_https ? 443 : 80)) {
                                 *u++ = ':';
                                 char pbuf[10]; itoa(current_port, pbuf);
                                 const char* ps = pbuf; while(*ps) *u++ = *ps++;
@@ -2024,9 +2482,9 @@ int main(int argc, char **argv) {
                         } else if (str_istarts_with(el->form_action, "http")) {
                             s = el->form_action; while(*s) *u++ = *s++;
                         } else {
-                            s = "http://"; while(*s) *u++ = *s++;
+                            s = current_is_https ? "https://" : "http://"; while(*s) *u++ = *s++;
                             s = current_host; while(*s) *u++ = *s++;
-                            if (current_port != 80) {
+                            if (current_port != (current_is_https ? 443 : 80)) {
                                 *u++ = ':';
                                 char pbuf[10]; itoa(current_port, pbuf);
                                 const char* ps = pbuf; while(*ps) *u++ = *ps++;
