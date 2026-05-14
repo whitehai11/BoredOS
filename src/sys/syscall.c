@@ -1860,6 +1860,51 @@ static uint64_t sys_cmd_tcp_recv_nb(const syscall_args_t *args) {
     return (uint64_t)network_tcp_recv_nb(buf, max_len);
 }
 
+static uint64_t sys_cmd_tls_connect(const syscall_args_t *args) {
+    extern void serial_write(const char *s);
+    serial_write("[SYS] tls_connect entered\n");
+
+    ipv4_address_t *ip   = (ipv4_address_t *)args->arg2;
+    uint16_t        port = (uint16_t)args->arg3;
+    const char     *host = (const char *)args->arg4;
+    char host_buf[256];
+    int i = 0;
+    if (host) {
+        while (i < 255 && host[i]) { host_buf[i] = host[i]; i++; }
+    }
+    host_buf[i] = 0;
+
+    extern int network_tls_connect(const ipv4_address_t *ip, uint16_t port, const char *hostname);
+    return (uint64_t)network_tls_connect(ip, port, host_buf);
+}
+
+static uint64_t sys_cmd_tls_send(const syscall_args_t *args) {
+    const void *data = (const void *)args->arg2;
+    size_t len = (size_t)args->arg3;
+    extern int network_tls_send(const void *data, size_t len);
+    return (uint64_t)network_tls_send(data, len);
+}
+
+static uint64_t sys_cmd_tls_recv(const syscall_args_t *args) {
+    void  *buf = (void *)args->arg2;
+    size_t max_len = (size_t)args->arg3;
+    extern int network_tls_recv(void *buf, size_t max_len);
+    return (uint64_t)network_tls_recv(buf, max_len);
+}
+
+static uint64_t sys_cmd_tls_recv_nb(const syscall_args_t *args) {
+    void  *buf = (void *)args->arg2;
+    size_t max_len = (size_t)args->arg3;
+    extern int network_tls_recv_nb(void *buf, size_t max_len);
+    return (uint64_t)network_tls_recv_nb(buf, max_len);
+}
+
+static uint64_t sys_cmd_tls_close(const syscall_args_t *args) {
+    (void)args;
+    extern int network_tls_close(void);
+    return (uint64_t)network_tls_close();
+}
+
 static uint64_t sys_cmd_set_resolution(const syscall_args_t *args) {
     uint16_t req_w = (uint16_t)args->arg2;
     uint16_t req_h = (uint16_t)args->arg3;
@@ -2474,6 +2519,11 @@ static const syscall_handler_fn sys_cmd_table[SYS_CMD_TABLE_SIZE] = {
     [SYSTEM_CMD_GET_KEYBOARD_LAYOUT] = sys_cmd_get_keyboard_layout,
     [SYSTEM_CMD_SET_MOUSE_CURSOR_SCALE] = sys_cmd_set_mouse_cursor_scale,
     [SYSTEM_CMD_GET_MOUSE_CURSOR_SCALE] = sys_cmd_get_mouse_cursor_scale,
+    [SYSTEM_CMD_TLS_CONNECT]            = sys_cmd_tls_connect,
+    [SYSTEM_CMD_TLS_SEND]               = sys_cmd_tls_send,
+    [SYSTEM_CMD_TLS_RECV]               = sys_cmd_tls_recv,
+    [SYSTEM_CMD_TLS_RECV_NB]            = sys_cmd_tls_recv_nb,
+    [SYSTEM_CMD_TLS_CLOSE]              = sys_cmd_tls_close,
     [SYSTEM_CMD_TTY_CREATE]          = sys_cmd_tty_create,
     [SYSTEM_CMD_TTY_READ_OUT]        = sys_cmd_tty_read_out,
     [SYSTEM_CMD_TTY_WRITE_IN]        = sys_cmd_tty_write_in,

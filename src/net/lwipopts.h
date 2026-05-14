@@ -40,4 +40,14 @@
 #define MEMP_NUM_PBUF              256
 #define MEMP_NUM_TCP_PCB           16
 
+// ----------------------------------------------------------------
+// TLS via mbedTLS (altcp layer)
+// ----------------------------------------------------------------
+#define LWIP_ALTCP                 1
+#define LWIP_ALTCP_TLS             1
+#define LWIP_ALTCP_TLS_MBEDTLS     1
+
+// Extra PCBs for TLS connections
+#define MEMP_NUM_ALTCP_PCB         8
+
 #endif /* LWIPOPTS_H */

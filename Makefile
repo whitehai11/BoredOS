@@ -49,7 +49,8 @@ C_SOURCES = $(wildcard $(SRC_DIR)/core/*.c) \
 			$(wildcard $(SRC_DIR)/net/third_party/lwip/core/*.c) \
 			$(wildcard $(SRC_DIR)/net/third_party/lwip/core/ipv4/*.c) \
 			$(SRC_DIR)/net/third_party/lwip/netif/ethernet.c \
-			$(SRC_DIR)/net/third_party/lwip/netif/bridgeif.c
+			$(SRC_DIR)/net/third_party/lwip/netif/bridgeif.c \
+			$(wildcard $(SRC_DIR)/net/third_party/mbedtls/library/*.c)
 
 ASM_SOURCES = $(wildcard $(SRC_DIR)/arch/*.asm)
 OBJ_FILES = $(patsubst $(SRC_DIR)/core/%.c, $(BUILD_DIR)/%.o, $(wildcard $(SRC_DIR)/core/*.c)) \
@@ -63,6 +64,7 @@ OBJ_FILES = $(patsubst $(SRC_DIR)/core/%.c, $(BUILD_DIR)/%.o, $(wildcard $(SRC_D
             $(patsubst $(SRC_DIR)/fs/%.c, $(BUILD_DIR)/%.o, $(wildcard $(SRC_DIR)/fs/*.c)) \
             $(patsubst $(SRC_DIR)/wm/%.c, $(BUILD_DIR)/%.o, $(wildcard $(SRC_DIR)/wm/*.c)) \
 			$(patsubst $(SRC_DIR)/net/third_party/lwip/%.c, $(BUILD_DIR)/lwip/%.o, $(filter $(SRC_DIR)/net/third_party/lwip/%.c, $(C_SOURCES))) \
+			$(patsubst $(SRC_DIR)/net/third_party/mbedtls/library/%.c, $(BUILD_DIR)/mbedtls/%.o, $(filter $(SRC_DIR)/net/third_party/mbedtls/library/%.c, $(C_SOURCES))) \
             $(patsubst $(SRC_DIR)/arch/%.asm, $(BUILD_DIR)/%.o, $(ASM_SOURCES))
 
 CFLAGS = -g -O2 -pipe -Wall -Wextra -std=gnu11 -ffreestanding \
@@ -72,8 +74,11 @@ CFLAGS = -g -O2 -pipe -Wall -Wextra -std=gnu11 -ffreestanding \
          -I$(SRC_DIR)/sys -I$(SRC_DIR)/mem -I$(SRC_DIR)/dev \
          -I$(SRC_DIR)/drivers \
          -I$(SRC_DIR)/net -I$(SRC_DIR)/net/nic -I$(SRC_DIR)/fs \
-         -I$(SRC_DIR)/wm -I$(SRC_DIR)/input
+         -I$(SRC_DIR)/wm -I$(SRC_DIR)/input \
+         -I$(SRC_DIR)/net/third_party/mbedtls/include \
+         -DMBEDTLS_CONFIG_FILE='"mbedtls/mbedtls_config.h"'
 
+LIBGCC := $(shell $(CC) -print-libgcc-file-name 2>/dev/null)
 LDFLAGS = -m elf_x86_64 -nostdlib -static -pie --no-dynamic-linker \
           -z text -z max-page-size=0x1000 -T linker.ld
 
@@ -175,6 +180,14 @@ $(BUILD_DIR)/lwip/%.o: $(SRC_DIR)/net/third_party/lwip/%.c | $(BUILD_DIR) limine
 	mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $@
 
+$(BUILD_DIR)/mbedtls/%.o: $(SRC_DIR)/net/third_party/mbedtls/library/%.c | $(BUILD_DIR) limine-setup
+	@printf "$(YELLOW)[CC]$(RESET)[mbedTLS] $< -> $@"
+	mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -I$(SRC_DIR)/net/mbedtls_compat \
+	    -Wno-unused-function -Wno-unused-variable \
+	    -Wno-implicit-function-declaration \
+	    -c $< -o $@
+
 $(BUILD_DIR)/%.o: $(SRC_DIR)/arch/%.asm | $(BUILD_DIR)
 	@printf "$(YELLOW)[ASM]$(RESET) $< -> $@"
 	$(NASM) $(NASMFLAGS) $< -o $@
@@ -194,7 +207,7 @@ $(BUILD_DIR)/process_asm.o: $(SRC_DIR)/arch/process_asm.asm | $(BUILD_DIR)
 $(KERNEL_ELF): $(OBJ_FILES)
 	$(call PRINT_STEP,LINKING KERNEL)
 	@printf "$(YELLOW)[LD]$(RESET) Linking kernel ELF: $@"
-	$(LD) $(LDFLAGS) -o $@ $(OBJ_FILES)
+	$(LD) $(LDFLAGS) -o $@ $(OBJ_FILES) $(LIBGCC)
 	@printf "$(GREEN)[OK]$(RESET) Kernel ELF built: $@"
 	$(call PRINT_STEP,BUILDING USERLAND)
 	$(MAKE) -C $(SRC_DIR)/userland

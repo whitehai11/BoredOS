@@ -10,13 +10,13 @@
 
 // Kernel string utilities
 void *memmove(void *dest, const void *src, uint64_t n);
-void memset(void *dest, int val, size_t len);
-void memcpy(void *dest, const void *src, size_t len);
+void *memset(void *dest, int val, size_t len);
+void *memcpy(void *dest, const void *src, size_t len);
 int memcmp (const void *str1, const void *str2, size_t count);
 size_t strlen(const char *str);
 int strcmp(const char *s1, const char *s2);
 int strncmp(const char *s1, const char *s2, size_t n);
-void strcpy(char *dest, const char *src);
+char *strcpy(char *dest, const char *src);
 int atoi(const char *str);
 void itoa(int n, char *buf);
 void itoa_hex(uint64_t n, char *buf);

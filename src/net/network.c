@@ -1,5 +1,10 @@
 #include "network.h"
+#include "tls_port.h"
+#include "ca_bundle.h"
 #include "lwip/init.h"
+#include "lwip/altcp.h"
+#include "lwip/altcp_tls.h"
+#include "mbedtls/ssl.h"
 #include "lwip/timeouts.h"
 #include "lwip/etharp.h"
 #include "lwip/dhcp.h"
@@ -66,6 +71,7 @@ int network_init(void) {
         return -1; // No supported NIC found
     }
 
+    tls_port_init(); // Initialize TLS heap + entropy before lwIP
     lwip_init();
     dns_init(); // Explicitly init DNS just in case
     
@@ -417,6 +423,165 @@ int network_has_ip(void) { return lwip_initialized && !ip4_addr_isany_val(*netif
 
 int network_send_frame(const void* data, size_t length) { return nic_send_packet(data, length); }
 int network_receive_frame(void* buffer, size_t buffer_size) { return nic_receive_packet(buffer, buffer_size); }
+
+/* =========================================================================
+ * TLS connection (altcp + mbedTLS)
+ * ========================================================================= */
+
+static struct altcp_pcb        *current_tls_pcb    = NULL;
+static struct altcp_tls_config *current_tls_config = NULL;
+static struct pbuf             *tls_recv_queue      = NULL;
+/* TODO: add per-connection state to support concurrent TLS sessions */
+static int tls_connect_done  = 0;
+static int tls_connect_error = 0;
+static int tls_closed        = 0;
+
+static err_t tls_recv_cb(void *arg, struct altcp_pcb *pcb, struct pbuf *p, err_t err) {
+    (void)arg; (void)pcb; (void)err;
+    if (!p) { tls_closed = 1; return ERR_OK; }
+    if (!tls_recv_queue) tls_recv_queue = p;
+    else                 pbuf_chain(tls_recv_queue, p);
+    return ERR_OK;
+}
+
+static void tls_err_cb(void *arg, err_t err) {
+    (void)arg; (void)err;
+    current_tls_pcb  = NULL;
+    tls_connect_error = 1;
+}
+
+static err_t tls_connected_cb(void *arg, struct altcp_pcb *pcb, err_t err) {
+    (void)arg; (void)pcb;
+    if (err == ERR_OK) tls_connect_done  = 1;
+    else               tls_connect_error = 1;
+    return ERR_OK;
+}
+
+int network_tls_connect(const ipv4_address_t *ip, uint16_t port, const char *hostname) {
+    if (!lwip_initialized) return -1;
+
+    uint64_t flags = spinlock_acquire_irqsave(&network_lock);
+
+    /* tear down any previous TLS session */
+    if (current_tls_pcb) { altcp_abort(current_tls_pcb); current_tls_pcb = NULL; }
+    if (current_tls_config) { altcp_tls_free_config(current_tls_config); current_tls_config = NULL; }
+    if (tls_recv_queue) { pbuf_free(tls_recv_queue); tls_recv_queue = NULL; }
+
+    tls_connect_done  = 0;
+    tls_connect_error = 0;
+    tls_closed        = 0;
+
+    current_tls_config = altcp_tls_create_config_client(g_ca_bundle, g_ca_bundle_len);
+    if (!current_tls_config) {
+        spinlock_release_irqrestore(&network_lock, flags);
+        return -1;
+    }
+
+    current_tls_pcb = altcp_tls_new(current_tls_config, IPADDR_TYPE_V4);
+    if (!current_tls_pcb) {
+        altcp_tls_free_config(current_tls_config); current_tls_config = NULL;
+        spinlock_release_irqrestore(&network_lock, flags);
+        return -1;
+    }
+
+    /* set SNI hostname so the server knows which cert to present */
+    if (hostname && hostname[0]) {
+        mbedtls_ssl_context *ssl = altcp_tls_context(current_tls_pcb);
+        if (ssl) mbedtls_ssl_set_hostname(ssl, hostname);
+    }
+
+    altcp_recv(current_tls_pcb, tls_recv_cb);
+    altcp_err (current_tls_pcb, tls_err_cb);
+
+    ip4_addr_t dest;
+    IP4_ADDR(&dest, ip->bytes[0], ip->bytes[1], ip->bytes[2], ip->bytes[3]);
+
+    err_t err = altcp_connect(current_tls_pcb, (const ip_addr_t *)&dest, port, tls_connected_cb);
+    spinlock_release_irqrestore(&network_lock, flags);
+    if (err != ERR_OK) { return -1; }
+
+    /* wait for TCP connect + TLS handshake (up to 20 s) */
+    uint32_t start = sys_now();
+    asm volatile("sti");
+    while (1) {
+        network_process_frames();
+        flags = spinlock_acquire_irqsave(&network_lock);
+        if (tls_connect_done)  { spinlock_release_irqrestore(&network_lock, flags); return 0; }
+        if (tls_connect_error) { spinlock_release_irqrestore(&network_lock, flags); return -1; }
+        spinlock_release_irqrestore(&network_lock, flags);
+        /* Brief pause with interrupts enabled so kernel_ticks advances */
+        asm volatile("sti; hlt");
+        if (sys_now() - start >= 20000) break;
+    }
+    return -1;
+}
+
+int network_tls_send(const void *data, size_t len) {
+    uint64_t flags;
+    err_t err;
+    if (!current_tls_pcb) return -1;
+    flags = spinlock_acquire_irqsave(&network_lock);
+    err = altcp_write(current_tls_pcb, data, (u16_t)len, TCP_WRITE_FLAG_COPY);
+    if (err == ERR_OK) altcp_output(current_tls_pcb);
+    spinlock_release_irqrestore(&network_lock, flags);
+    return (err == ERR_OK) ? (int)len : -1;
+}
+
+int network_tls_recv(void *buf, size_t max_len) {
+    if (!lwip_initialized) return -1;
+    uint32_t start = sys_now();
+    asm volatile("sti");
+    while (1) {
+        uint64_t flags = spinlock_acquire_irqsave(&network_lock);
+        if (tls_recv_queue) {
+            size_t to_copy = max_len;
+            if (to_copy > tls_recv_queue->tot_len) to_copy = tls_recv_queue->tot_len;
+            if (to_copy > 0xFFFF) to_copy = 0xFFFF;
+            size_t copied = pbuf_copy_partial(tls_recv_queue, buf, (u16_t)to_copy, 0);
+            struct pbuf *rem = pbuf_free_header(tls_recv_queue, (u16_t)copied);
+            if (current_tls_pcb) altcp_recved(current_tls_pcb, (u16_t)copied);
+            tls_recv_queue = rem;
+            spinlock_release_irqrestore(&network_lock, flags);
+            return (int)copied;
+        }
+        if (tls_closed)        { spinlock_release_irqrestore(&network_lock, flags); return 0; }
+        if (tls_connect_error) { spinlock_release_irqrestore(&network_lock, flags); return -1; }
+        spinlock_release_irqrestore(&network_lock, flags);
+        if (sys_now() - start >= 30000) return 0;
+        network_process_frames();
+        k_delay(10);
+    }
+}
+
+int network_tls_recv_nb(void *buf, size_t max_len) {
+    if (!lwip_initialized) return -1;
+    network_process_frames();
+    uint64_t flags = spinlock_acquire_irqsave(&network_lock);
+    if (!tls_recv_queue) {
+        int ret = tls_closed ? -2 : 0;
+        spinlock_release_irqrestore(&network_lock, flags);
+        return ret;
+    }
+    size_t to_copy = max_len;
+    if (to_copy > tls_recv_queue->tot_len) to_copy = tls_recv_queue->tot_len;
+    if (to_copy > 0xFFFF) to_copy = 0xFFFF;
+    size_t copied = pbuf_copy_partial(tls_recv_queue, buf, (u16_t)to_copy, 0);
+    struct pbuf *rem = pbuf_free_header(tls_recv_queue, (u16_t)copied);
+    if (current_tls_pcb) altcp_recved(current_tls_pcb, (u16_t)copied);
+    tls_recv_queue = rem;
+    spinlock_release_irqrestore(&network_lock, flags);
+    return (int)copied;
+}
+
+int network_tls_close(void) {
+    uint64_t flags = spinlock_acquire_irqsave(&network_lock);
+    if (tls_recv_queue) { pbuf_free(tls_recv_queue); tls_recv_queue = NULL; }
+    if (current_tls_pcb) { altcp_abort(current_tls_pcb); current_tls_pcb = NULL; }
+    if (current_tls_config) { altcp_tls_free_config(current_tls_config); current_tls_config = NULL; }
+    tls_closed = tls_connect_done = tls_connect_error = 0;
+    spinlock_release_irqrestore(&network_lock, flags);
+    return 0;
+}
 
 static u16_t icmp_cksum(void *data, int len) {
     u32_t sum = 0;

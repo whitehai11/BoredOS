@@ -1060,6 +1060,35 @@ static void control_panel_paint_network(ui_window_t win) {
     
     widget_button_draw(&settings_ctx, &btn_net_set_dns);
     ui_draw_string(win, offset_x + 225, info_y + 4, "SET", COLOR_DARK_TEXT);
+
+    info_y += 40;
+
+    // TLS Status
+    ui_draw_string(win, offset_x, info_y, "TLS:", COLOR_DARK_TEXT);
+    info_y += 18;
+
+    ui_draw_string(win, offset_x + 10, info_y, "Engine:", COLOR_DARK_TEXT);
+    ui_draw_string(win, offset_x + 70, info_y, "mbedTLS 3.6.2", COLOR_DKGRAY);
+    info_y += 16;
+
+    ui_draw_string(win, offset_x + 10, info_y, "Protocol:", COLOR_DARK_TEXT);
+    ui_draw_string(win, offset_x + 70, info_y, "TLS 1.2", COLOR_DKGRAY);
+    info_y += 16;
+
+    ui_draw_string(win, offset_x + 10, info_y, "CA Bundle:", COLOR_DARK_TEXT);
+    ui_draw_string(win, offset_x + 80, info_y, "5 roots (LE, DigiCert, Sectigo, Google)", COLOR_DKGRAY);
+    info_y += 16;
+
+    // always compiled in, network just needs an IP for actual connections
+    ui_draw_string(win, offset_x + 10, info_y, "Ready:", COLOR_DARK_TEXT);
+    ui_draw_string(win, offset_x + 60, info_y, "Yes", 0xFF90EE90);
+    info_y += 16;
+
+    ui_draw_string(win, offset_x + 10, info_y, "Conns:", COLOR_DARK_TEXT);
+    if (sys_network_has_ip())
+        ui_draw_string(win, offset_x + 60, info_y, "Online", 0xFF90EE90);
+    else
+        ui_draw_string(win, offset_x + 60, info_y, "Offline (init network first)", 0xFFFF6B6B);
 }
 
 static void control_panel_paint_desktop(ui_window_t win) {

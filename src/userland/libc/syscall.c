@@ -347,6 +347,30 @@ void sys_parallel_run(void (*fn)(void*), void **args, int count) {
     syscall5(SYS_SYSTEM, SYSTEM_CMD_PARALLEL_RUN, (uint64_t)fn, (uint64_t)args, (uint64_t)count, 0);
 }
 
+int sys_tls_connect(const net_ipv4_address_t *ip, uint16_t port, const char *hostname) {
+    return (int)syscall4(SYS_SYSTEM, SYSTEM_CMD_TLS_CONNECT,
+                         (uint64_t)ip, (uint64_t)port, (uint64_t)hostname);
+}
+
+int sys_tls_send(const void *data, size_t len) {
+    return (int)syscall3(SYS_SYSTEM, SYSTEM_CMD_TLS_SEND,
+                         (uint64_t)data, (uint64_t)len);
+}
+
+int sys_tls_recv(void *buf, size_t max_len) {
+    return (int)syscall3(SYS_SYSTEM, SYSTEM_CMD_TLS_RECV,
+                         (uint64_t)buf, (uint64_t)max_len);
+}
+
+int sys_tls_recv_nb(void *buf, size_t max_len) {
+    return (int)syscall3(SYS_SYSTEM, SYSTEM_CMD_TLS_RECV_NB,
+                         (uint64_t)buf, (uint64_t)max_len);
+}
+
+int sys_tls_close(void) {
+    return (int)syscall2(SYS_SYSTEM, SYSTEM_CMD_TLS_CLOSE, 0);
+}
+
 // ELF metadata API
 int sys_get_elf_metadata(const char *path, boredos_app_metadata_t *out_metadata) {
     return (int)syscall4(SYS_SYSTEM, SYSTEM_CMD_GET_ELF_METADATA,

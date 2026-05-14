@@ -98,6 +98,21 @@ void kernel_panic(registers_t *regs, const char *error_name) {
         serial_write(hex_buf);
         serial_write("\n");
 
+        serial_write("RSP: 0x");
+        itoa_hex(regs->rsp, hex_buf);
+        serial_write(hex_buf);
+        serial_write("\n");
+
+        serial_write("RAX: 0x");
+        itoa_hex(regs->rax, hex_buf);
+        serial_write(hex_buf);
+        serial_write("\n");
+
+        serial_write("RBX: 0x");
+        itoa_hex(regs->rbx, hex_buf);
+        serial_write(hex_buf);
+        serial_write("\n");
+
         if (regs->int_no == 14) {
             uint64_t cr2;
             asm volatile("mov %%cr2, %0" : "=r"(cr2));

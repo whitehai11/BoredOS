@@ -315,10 +315,10 @@ altcp_bind(struct altcp_pcb *conn, const ip_addr_t *ipaddr, u16_t port)
 err_t
 altcp_connect(struct altcp_pcb *conn, const ip_addr_t *ipaddr, u16_t port, altcp_connected_fn connected)
 {
-  if (conn && conn->fns && conn->fns->connect) {
-    return conn->fns->connect(conn, ipaddr, port, connected);
+  if (!conn || !conn->fns || !conn->fns->connect) {
+    return ERR_VAL;
   }
-  return ERR_VAL;
+  return conn->fns->connect(conn, ipaddr, port, connected);
 }
 
 /**

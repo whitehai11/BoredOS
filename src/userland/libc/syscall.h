@@ -72,6 +72,11 @@
 #define SYSTEM_CMD_GET_KEYBOARD_LAYOUT 51
 #define SYSTEM_CMD_SET_MOUSE_CURSOR_SCALE 52
 #define SYSTEM_CMD_GET_MOUSE_CURSOR_SCALE 53
+#define SYSTEM_CMD_TLS_CONNECT  54
+#define SYSTEM_CMD_TLS_SEND     55
+#define SYSTEM_CMD_TLS_RECV     56
+#define SYSTEM_CMD_TLS_RECV_NB  57
+#define SYSTEM_CMD_TLS_CLOSE    58
 #define SYSTEM_CMD_SET_TEXT_COLOR 29
 #define SYSTEM_CMD_SET_WALLPAPER_PATH 31
 #define SYSTEM_CMD_RTC_SET 32
@@ -256,6 +261,12 @@ int sys_tcp_close(void);
 int sys_dns_lookup(const char *name, net_ipv4_address_t *out_ip);
 int sys_set_dns_server(const net_ipv4_address_t *ip);
 void sys_network_force_unlock(void);
+
+int sys_tls_connect(const net_ipv4_address_t *ip, uint16_t port, const char *hostname);
+int sys_tls_send(const void *data, size_t len);
+int sys_tls_recv(void *buf, size_t max_len);
+int sys_tls_recv_nb(void *buf, size_t max_len);
+int sys_tls_close(void);
 void sys_yield(void);
 
 // ELF metadata API

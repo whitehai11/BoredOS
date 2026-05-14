@@ -19,6 +19,7 @@ src/userland/bin/
 
 # Others
 .gitignore
+CLAUDE.md
 src/userland/cli/third_party/tcc/tcc.elf
 src/userland/sdk/include/*
 limine

@@ -176,7 +176,112 @@ static void cmd_curl(const char* url) {
     sys_tcp_close();
 }
 
+static long long ping_ticks(void) {
+    return (long long)sys_system(SYSTEM_CMD_GET_TICKS, 0, 0, 0, 0);
+}
+
+static void cmd_ping_tls(const char *host, int port) {
+    net_ipv4_address_t ip;
+    long long t0, t1, tc0, tc1, tr0, tr1;
+
+    printf("Pinging %s:%d via TLS...\n", host, port);
+
+    printf("  DNS  : resolving %s ...", host);
+    t0 = ping_ticks();
+    if (resolve_host(host, &ip) != 0) {
+        printf(" FAILED\n");
+        return;
+    }
+    t1 = ping_ticks();
+    printf(" "); print_ip(&ip); printf("  (%lld ms)\n", (t1 - t0) / 60);
+
+    printf("  TLS  : connecting ...");
+    tc0 = ping_ticks();
+    if (sys_tls_connect(&ip, (uint16_t)port, host) != 0) {
+        printf(" FAILED (handshake error or cert rejected)\n");
+        return;
+    }
+    tc1 = ping_ticks();
+    printf(" OK  (%lld ms)\n", (tc1 - tc0) / 60);
+
+    /* minimal HTTP HEAD request */
+    char req[512];
+    int rlen = 0;
+    const char *p;
+#define _APPEND(s) do { p=(s); while(*p && rlen<511) req[rlen++]=*p++; } while(0)
+    _APPEND("HEAD / HTTP/1.1\r\nHost: ");
+    _APPEND(host);
+    _APPEND("\r\nUser-Agent: BoredOS/net\r\nConnection: close\r\n\r\n");
+#undef _APPEND
+    req[rlen] = 0;
+
+    printf("  Send : HEAD / HTTP/1.1 ...");
+    if (sys_tls_send(req, (size_t)rlen) < 0) {
+        printf(" FAILED\n");
+        sys_tls_close();
+        return;
+    }
+    printf(" sent %d bytes\n", rlen);
+
+    static char resp[4096];
+    int total = 0;
+    tr0 = ping_ticks();
+    while (total < (int)sizeof(resp) - 1) {
+        int n = sys_tls_recv(resp + total, sizeof(resp) - 1 - (size_t)total);
+        if (n <= 0) break;
+        total += n;
+        resp[total] = 0;
+        if (strstr(resp, "\r\n")) break;
+    }
+    tr1 = ping_ticks();
+    resp[total] = 0;
+    sys_tls_close();
+
+    if (total == 0) {
+        printf("  Recv : no data received\n");
+        return;
+    }
+
+    /* extract status line */
+    char status_line[128] = {0};
+    int i = 0;
+    while (i < total && resp[i] != '\r' && resp[i] != '\n' && i < 127) {
+        status_line[i] = resp[i];
+        i++;
+    }
+    status_line[i] = 0;
+    printf("  Recv : %s  (%lld ms)\n", status_line, (tr1 - tr0) / 60);
+    printf("\n  Result: TLS connection to %s:%d successful\n", host, port);
+}
+
 static void cmd_ping(const char* host) {
+    /* detect https:// → TLS ping */
+    if (host[0]=='h' && host[1]=='t' && host[2]=='t' && host[3]=='p' &&
+        host[4]=='s' && host[5]==':' && host[6]=='/' && host[7]=='/') {
+        cmd_ping_tls(host + 8, 443);
+        return;
+    }
+
+    /* strip optional http:// */
+    if (host[0]=='h' && host[1]=='t' && host[2]=='t' && host[3]=='p' &&
+        host[4]==':' && host[5]=='/' && host[6]=='/') {
+        host += 7;
+    }
+
+    /* host:port → TLS ping */
+    const char *colon = strchr(host, ':');
+    if (colon) {
+        static char host_buf[256];
+        int len = (int)(colon - host);
+        if (len > 255) len = 255;
+        for (int i = 0; i < len; i++) host_buf[i] = host[i];
+        host_buf[len] = 0;
+        int port = atoi(colon + 1);
+        cmd_ping_tls(host_buf, port);
+        return;
+    }
+
+    /* plain ICMP ping */
     net_ipv4_address_t ip;
     if (resolve_host(host, &ip) != 0) {
         printf("Failed to resolve %s\n", host);
@@ -234,7 +339,7 @@ static void cmd_netinfo(void) {
 int main(int argc, char** argv) {
     if (argc < 2) {
         printf("Usage: net <command> [args]\n");
-        printf("Commands: dhcp, dnsset <ip>, dig <host>, nc <host> <port>, curl <url>, ping <host>, init, info, unlock\n");
+        printf("Commands: dhcp, dnsset <ip>, dig <host>, nc <host> <port>, curl <url>, ping <host|https://host>, init, info, unlock\n");
         return 1;
     }
     
